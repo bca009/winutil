@@ -42,7 +42,7 @@ function Invoke-WinUtilSSHServer {
     } else {
         try {
             Write-Host "ssh-agent is not running. Attempting to restart..."
-            Restart-Service -Name sshd -Force
+            Restart-Service -Name 'ssh-agent' -Force
             Write-Host "ssh-agent has been restarted successfully."
         } catch {
             Write-Host "Failed to restart ssh-agent : $_"
