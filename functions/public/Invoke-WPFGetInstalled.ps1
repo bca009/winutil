@@ -1,53 +1,52 @@
 function Invoke-WPFGetInstalled {
     <#
-    TODO: Add the Option to use Chocolatey as Engine
     .SYNOPSIS
-        Invokes the function that gets the checkboxes to check in a new runspace
+        Detects what is already installed or applied and ticks the matching boxes
 
     .PARAMETER checkbox
         Indicates whether to check for installed 'winget' programs or applied 'tweaks'
 
     #>
     param($checkbox)
-    if ($sync.ProcessRunning) {
-        $msg = "[Invoke-WPFGetInstalled] Install process is currently running."
-        [System.Windows.MessageBox]::Show($msg, "Winutil", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-        return
-    }
 
     if (($sync.ChocoRadioButton.IsChecked -eq $false) -and ((Test-WinUtilPackageManager -winget) -eq "not-installed") -and $checkbox -eq "winget") {
         return
     }
-    $managerPreference = $sync.preferences.packagemanager
 
-    Invoke-WPFRunspace -ParameterList @(("managerPreference", $managerPreference),("checkbox", $checkbox)) -ScriptBlock {
-        param (
-            [string]$checkbox,
-            [PackageManagers]$managerPreference
-        )
-        $sync.ProcessRunning = $true
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "Indeterminate" }
+    Start-WinUtilJob -Name "Detect installed" -Description "Checking what is already installed" -Parameters @{
+        Checkbox = $checkbox
+        ManagerPreference = $sync.preferences.packagemanager
+    } -ScriptBlock {
+        param($Checkbox, $ManagerPreference)
 
-        if ($checkbox -eq "winget") {
-            Write-Host "Getting Installed Programs..."
-            switch ($managerPreference) {
-                "Choco"{$Checkboxes = Invoke-WinUtilCurrentSystem -CheckBox "choco"; break}
-                "Winget"{$Checkboxes = Invoke-WinUtilCurrentSystem -CheckBox $checkbox; break}
-            }
-        }
-        elseif ($checkbox -eq "tweaks") {
-            Write-Host "Getting Installed Tweaks..."
-            $Checkboxes = Invoke-WinUtilCurrentSystem -CheckBox $checkbox
+        Step-WinUtilJob -Status "Checking what is already installed" -State "Indeterminate"
+
+        $found = @()
+        if ($Checkbox -eq "winget") {
+            $source = if ($ManagerPreference -eq "Choco") { "choco" } else { $Checkbox }
+            $found = @(Invoke-WinUtilCurrentSystem -CheckBox $source)
+        } elseif ($Checkbox -eq "tweaks") {
+            $found = @(Invoke-WinUtilCurrentSystem -CheckBox $Checkbox)
         }
 
-        $sync.form.Dispatcher.invoke({
-            foreach ($checkbox in $Checkboxes) {
-                $sync.$checkbox.ischecked = $True
-            }
-        })
+        Write-WinUtilLog -Component "Install" -Message "Detected $($found.Count) existing item(s) for $Checkbox."
 
-        Write-Host "Done..."
-        $sync.ProcessRunning = $false
-        Invoke-WPFUIThread -ScriptBlock { Set-WinUtilTaskbaritem -state "None" }
+        # Ticking boxes touches the controls, so it happens on the interface thread
+        Invoke-WPFUIThread -Parameters @{ Checkbox = $Checkbox; Found = $found } -ScriptBlock {
+            param($Checkbox, $Found)
+
+            if ($Checkbox -eq "winget") {
+                foreach ($name in $Found) {
+                    if (-not $sync.selectedApps.Contains($name)) {
+                        $sync.selectedApps.Add($name)
+                    }
+                }
+                Reset-WPFCheckBoxes -checkboxfilterpattern "WPFInstall*"
+            } else {
+                foreach ($name in $Found) {
+                    $sync.$name.ischecked = $true
+                }
+            }
+        }
     }
 }

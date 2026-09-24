@@ -16,15 +16,20 @@ function Initialize-InstallCategoryAppList {
             $Apps
         )
 
-        # Pre-group apps by category
+        # Pre-group apps by category before creating WPF controls. Lists, because appending to
+        # an array copies it and there are several hundred apps.
         $appsByCategory = @{}
+        # Indexed, not dynamic member, lookup: the latter goes through the PSObject adapter and
+        # costs about seventy times as much per app.
         foreach ($appKey in $Apps.Keys) {
-            $category = $Apps.$appKey.Category
+            $category = $Apps[$appKey].Category
             if (-not $appsByCategory.ContainsKey($category)) {
-                $appsByCategory[$category] = @()
+                $appsByCategory[$category] = [System.Collections.Generic.List[string]]::new()
             }
-            $appsByCategory[$category] += $appKey
+            $appsByCategory[$category].Add($appKey)
         }
+        $sync.InstallAppRenderQueue = [System.Collections.Queue]::new()
+
         foreach ($category in $($appsByCategory.Keys | Sort-Object)) {
             # Create a container for category label + apps
             $categoryContainer = New-Object Windows.Controls.StackPanel
@@ -52,23 +57,28 @@ function Initialize-InstallCategoryAppList {
 
             # Add click handler to toggle category visibility
             $toggleButton.Add_MouseLeftButtonUp({
-                param($sender, $e)
+                param($categoryToggle)
 
                 # Find the parent StackPanel (categoryContainer)
-                $categoryContainer = $sender.Parent
+                $categoryContainer = $categoryToggle.Parent
                 if ($categoryContainer -and $categoryContainer.Children.Count -ge 2) {
                     # The WrapPanel is the second child
                     $wrapPanel = $categoryContainer.Children[1]
+
+                    # An explicit click wins over anything filtering expanded automatically
+                    if ($sync.AppCategoryAutoExpanded) {
+                        $sync.AppCategoryAutoExpanded.Remove(($categoryToggle.Content -replace '^[+-] ', ''))
+                    }
 
                     # Toggle visibility
                     if ($wrapPanel.Visibility -eq [Windows.Visibility]::Visible) {
                         $wrapPanel.Visibility = [Windows.Visibility]::Collapsed
                         # Change - to +
-                        $sender.Content = $sender.Content -replace "^- ", "+ "
+                        $categoryToggle.Content = $categoryToggle.Content -replace "^- ", "+ "
                     } else {
                         $wrapPanel.Visibility = [Windows.Visibility]::Visible
                         # Change + to -
-                        $sender.Content = $sender.Content -replace "^\+ ", "- "
+                        $categoryToggle.Content = $categoryToggle.Content -replace "^\+ ", "- "
                     }
                 }
             })
@@ -89,9 +99,12 @@ function Initialize-InstallCategoryAppList {
             # Add the entire category container to the target element
             $null = $TargetElement.Items.Add($categoryContainer)
 
-            # Add apps to the wrap panel
-            $appsByCategory[$category] | Sort-Object | ForEach-Object {
-                $sync.$_ = $(Initialize-InstallAppEntry -TargetElement $wrapPanel -AppKey $_)
-            }
+            $sync.InstallAppRenderQueue.Enqueue([pscustomobject]@{
+                Category = $category
+                TargetElement = $wrapPanel
+                AppKeys = @($appsByCategory[$category] | Sort-Object)
+            })
         }
+
+        Start-WinUtilInstallAppRendering
     }

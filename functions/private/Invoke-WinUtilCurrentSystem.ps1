@@ -11,32 +11,42 @@ Function Invoke-WinUtilCurrentSystem {
     #>
 
     param(
-        $CheckBox
+        $CheckBox,
+        [switch]$BypassToggleStatusCache,
+        [switch]$StopOnReadError
     )
     if ($CheckBox -eq "choco") {
         $apps = (choco list | Select-String -Pattern "^\S+").Matches.Value
-        $filter = Get-WinUtilVariables -Type Checkbox | Where-Object {$psitem -like "WPFInstall*"}
-        $sync.GetEnumerator() | Where-Object {$psitem.Key -in $filter} | ForEach-Object {
-            $dependencies = @($sync.configs.applications.$($psitem.Key).choco -split ";")
-            if ($dependencies -in $apps) {
-                Write-Output $psitem.name
+        $sync.configs.applicationsHashtable.GetEnumerator() | ForEach-Object {
+            $packageId = ($_.Value.choco -split ";")[-1].Trim()
+            if ($packageId -ne "na" -and $packageId -in $apps) {
+                Write-Output $_.Key
             }
         }
     }
 
     if ($checkbox -eq "winget") {
-
         $originalEncoding = [Console]::OutputEncoding
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
-        $Sync.InstalledPrograms = winget list -s winget | Select-Object -skip 3 | ConvertFrom-String -PropertyNames "Name", "Id", "Version", "Available" -Delimiter '\s{2,}'
-        [Console]::OutputEncoding = $originalEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+            $installedProgramOutput = @(winget list --accept-source-agreements --disable-interactivity 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "winget list failed with exit code $LASTEXITCODE."
+            }
+        } finally {
+            [Console]::OutputEncoding = $originalEncoding
+        }
+        $installedProgramText = $installedProgramOutput -join "`n"
 
-        $filter = Get-WinUtilVariables -Type Checkbox | Where-Object {$psitem -like "WPFInstall*"}
-        $sync.GetEnumerator() | Where-Object {$psitem.Key -in $filter} | ForEach-Object {
-            $dependencies = @($sync.configs.applications.$($psitem.Key).winget -split ";")
+        $sync.configs.applicationsHashtable.GetEnumerator() | ForEach-Object {
+            $packageId = (($_.Value.winget -split ";")[-1] -replace "^msstore:", "").Trim()
+            if ([string]::IsNullOrWhiteSpace($packageId) -or $packageId -eq "na") {
+                return
+            }
 
-            if ($dependencies[-1] -in $sync.InstalledPrograms.Id) {
-                Write-Output $psitem.name
+            $packagePattern = "(?im)[^\S\r\n]{2,}$([regex]::Escape($packageId))(?=[^\S\r\n]{2,}|$)"
+            if ($installedProgramText -match $packagePattern) {
+                Write-Output $_.Key
             }
         }
     }
@@ -44,6 +54,7 @@ Function Invoke-WinUtilCurrentSystem {
     if ($CheckBox -eq "tweaks") {
 
         if (!(Test-Path 'HKU:\')) {$null = (New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS)}
+        $readErrorAction = if ($StopOnReadError) { "Stop" } else { "SilentlyContinue" }
 
         $sync.configs.tweaks | Get-Member -MemberType NoteProperty | ForEach-Object {
 
@@ -51,15 +62,15 @@ Function Invoke-WinUtilCurrentSystem {
             $entry = $sync.configs.tweaks.$Config
             $registryKeys = $entry.registry
             $serviceKeys = $entry.service
-            $appxKeys = $entry.appx
-            $invokeScript = $entry.InvokeScript
             $entryType = $entry.Type
 
-            if ($registryKeys -or $serviceKeys) {
+            if (($registryKeys -or $serviceKeys) -and $entryType -ne "Combobox") {
                 $Values = @()
 
                 if ($entryType -eq "Toggle") {
-                    if (-not (Get-WinUtilToggleStatus $Config)) {
+                    if (-not (Get-WinUtilToggleStatus $Config `
+                        -BypassCache:$BypassToggleStatusCache `
+                        -StopOnReadError:$StopOnReadError)) {
                         $values += $False
                     }
                 } else {
@@ -71,8 +82,12 @@ Function Invoke-WinUtilCurrentSystem {
                             $registryTotal++
                             $regstate = $null
 
-                            if (Test-Path $tweak.Path) {
-                                $regstate = Get-ItemProperty -Name $tweak.Name -Path $tweak.Path -ErrorAction SilentlyContinue | Select-Object -ExpandProperty $($tweak.Name)
+                            if (Test-Path $tweak.Path -ErrorAction $readErrorAction) {
+                                if ($StopOnReadError) {
+                                    $regstate = (Get-ItemProperty -Path $tweak.Path -ErrorAction Stop).$($tweak.Name)
+                                } else {
+                                    $regstate = Get-ItemProperty -Name $tweak.Name -Path $tweak.Path -ErrorAction SilentlyContinue | Select-Object -ExpandProperty $($tweak.Name)
+                                }
                             }
 
                             if ($null -eq $regstate) {
@@ -102,7 +117,17 @@ Function Invoke-WinUtilCurrentSystem {
 
                 Foreach ($tweaks in $serviceKeys) {
                     Foreach ($tweak in $tweaks) {
-                        $Service = Get-Service -Name $tweak.Name
+                        try {
+                            $Service = Get-Service -Name $tweak.Name -ErrorAction $readErrorAction
+                        } catch {
+                            if ($StopOnReadError -and $_.FullyQualifiedErrorId -like "NoServiceFoundForGivenName*") {
+                                # A removed optional service means this tweak is not applied; it does
+                                # not make the registry and service state for every other tweak unknown.
+                                $values += $False
+                                continue
+                            }
+                            throw
+                        }
 
                         if ($Service) {
                             $actualValue = $Service.StartType
@@ -110,6 +135,8 @@ Function Invoke-WinUtilCurrentSystem {
                             if ($expectedValue -ne $actualValue) {
                                 $values += $False
                             }
+                        } elseif ($StopOnReadError) {
+                            $values += $False
                         }
                     }
                 }

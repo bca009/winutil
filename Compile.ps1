@@ -2,23 +2,22 @@ param (
     [switch]$Run
 )
 
-$OFS = "`r`n" # Makes it so we dont need to add -Raw to every Get-Content command
+$OFS = "`r`n"
 
 # Variable to sync between runspaces
 $sync = [Hashtable]::Synchronized(@{})
 $sync.configs = @{}
 
-# Create the script in memory.
-$script = [System.Collections.Generic.List[string]]::new()
+$script = (Get-Content -Path scripts\start.ps1) -replace '#{replaceme}', (Get-Date -Format 'yy.MM.dd')
+$isLocalCompile = -not [string]::Equals($env:GITHUB_ACTIONS, "true", [StringComparison]::OrdinalIgnoreCase)
+$script = $script -replace '#{islocalcompile}', $isLocalCompile.ToString().ToLowerInvariant()
 
-$script.Add(
-    ((Get-Content -Path scripts\start.ps1) -replace '#{replaceme}', (Get-Date -Format 'yy.MM.dd'))
-)
-
-$script.Add((Get-ChildItem -Path functions -Recurse -File | Get-Content))
+$script += Get-ChildItem -Path functions -Recurse -File | ForEach-Object {
+    Get-Content -Path $_.FullName -Raw
+}
 
 Get-ChildItem config | ForEach-Object {
-    $obj = Get-Content -Path $_.FullName | ConvertFrom-Json
+    $obj = Get-Content -Path $_.FullName -Raw | ConvertFrom-Json
 
     if ($_.Name -eq "applications.json") {
         $fixed = [ordered]@{}
@@ -31,17 +30,16 @@ Get-ChildItem config | ForEach-Object {
     $json = $obj | ConvertTo-Json -Depth 10
 
     $sync.configs[$_.BaseName] = $obj
-    $script.Add("`$sync.configs.$($_.BaseName) = @'`r`n$json`r`n'@ | ConvertFrom-Json")
+    $script += "`$sync.configs.$($_.BaseName) = @'`r`n$json`r`n'@ | ConvertFrom-Json"
 }
 
-# Read the entire XAML file as a single string, preserving line breaks
-$xaml = Get-Content -Path xaml\inputXML.xaml
-$script.Add('$inputXML = @''' + "`n" + $xaml + "`n" + '''@')
+$xaml = Get-Content -Path xaml\inputXML.xaml -Raw
+$script += "`$inputXML = @'`r`n$xaml`r`n'@"
 
-$autounattendXml = Get-Content -Path tools\autounattend.xml
-$script.Add("`$WinUtilAutounattendXml = @'`r`n$autounattendXml`r`n'@")
+$autounattendXml = Get-Content -Path tools\autounattend.xml -Raw
+$script += "`$WinUtilAutounattendXml = @'`r`n$autounattendXml`r`n'@"
 
-$script.Add((Get-Content -Path scripts\main.ps1))
+$script += Get-Content -Path scripts\main.ps1 -Raw
 
 Set-Content -Path winutil.ps1 -Value $script
 

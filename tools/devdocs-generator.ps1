@@ -1,7 +1,7 @@
 <#
     .DESCRIPTION
-    Generates Hugo markdown docs from config/tweaks.json and config/feature.json.
-    Run by the GitHub Actions docs workflow before Hugo build.
+    Generates Astro/Starlight markdown docs from config/tweaks.json and config/feature.json.
+    Run by the GitHub Actions docs workflow before the Astro build.
 #>
 
 function Update-Progress {
@@ -27,12 +27,10 @@ function Get-RawJsonBlock {
 
     $escapedName = [regex]::Escape($ItemName)
     $startIndex  = -1
-    $startIndent = ""
 
     for ($i = 0; $i -lt $JsonLines.Count; $i++) {
         if ($JsonLines[$i] -match "^(\s*)`"$escapedName`"\s*:\s*\{") {
             $startIndex  = $i
-            $startIndent = $matches[1]
             break
         }
     }
@@ -42,10 +40,26 @@ function Get-RawJsonBlock {
         return $null
     }
 
-    $escapedIndent = [regex]::Escape($startIndent)
-    $endIndex      = -1
+    # Use brace-depth tracking to find the closing brace
+    $endIndex = -1
+    $depth = 1  # We're starting inside the opening brace
     for ($i = ($startIndex + 1); $i -lt $JsonLines.Count; $i++) {
-        if ($JsonLines[$i] -match "^$escapedIndent\}") {
+        $line = $JsonLines[$i]
+
+        # Count braces in this line, ignoring those in strings
+        $inString = $false
+        $chars = $line.ToCharArray()
+        for ($k = 0; $k -lt $chars.Count; $k++) {
+            if ($chars[$k] -eq '"' -and ($k -eq 0 -or $chars[$k-1] -ne '\')) {
+                $inString = -not $inString
+            } elseif (-not $inString) {
+                if ($chars[$k] -eq '{') { $depth++ }
+                elseif ($chars[$k] -eq '}') { $depth-- }
+            }
+        }
+
+        # Found the closing brace of the item
+        if ($depth -eq 0) {
             $endIndex = $i
             break
         }
@@ -67,10 +81,28 @@ function Get-RawJsonBlock {
         }
     }
 
+    # Include the item's own closing brace, stripped of the trailing comma that
+    # only exists to separate it from the next sibling in the parent object.
+    $closingLine = $JsonLines[$endIndex] -replace ',\s*$', ''
+
     return @{
         LineNumber = $startIndex + 1
-        RawText    = ($JsonLines[$startIndex..$lastContentIndex] -join "`r`n")
+        RawText    = (($JsonLines[$startIndex..$lastContentIndex] + $closingLine) -join "`r`n")
     }
+}
+
+function Get-GeneratedFromNote {
+    # Builds the Starlight ":::note" aside pointing back at the source file for an entry.
+    param (
+        [Parameter(Mandatory)]
+        [string]$SourceRelativePath
+    )
+
+    $githubUrl = "https://github.com/ChrisTitusTech/winutil/blob/main/$SourceRelativePath"
+    $note  = ":::note`r`n"
+    $note += "This page is generated from [``$SourceRelativePath``]($githubUrl). Do not edit this page directly.`r`n"
+    $note += ":::`r`n`r`n"
+    return $note
 }
 
 function Get-ButtonFunctionMapping {
@@ -121,34 +153,86 @@ function Add-LinkAttributeToJson {
         }
         if ($startIdx -eq -1) { continue }
 
-        # Derive indentation: propIndent is one level deeper than the item start.
-        # Used to target only top-level properties and skip nested object braces.
-        $null          = $lines[$startIdx] -match '^(\s*)'
-        $propIndent    = $matches[1] + '  '
-        $propIndentLen = $propIndent.Length
-        $escapedPropIndent = [regex]::Escape($propIndent)
+        # Derive indentation used by top-level properties in the item.
+        # Prefer existing property indentation to avoid inheriting bad key indentation.
+        $null       = $lines[$startIdx] -match '^(\s*)'
+        $propIndent = $matches[1] + '  '
 
-        # Scan forward: update existing "link" or find the closing brace to insert one.
-        # Closing brace is matched by indent <= propIndentLen to handle inconsistent formatting.
-        $linkUpdated   = $false
-        $closeBraceIdx = -1
-        for ($j = $startIdx + 1; $j -lt $lines.Count; $j++) {
-            if ($lines[$j] -match "^$escapedPropIndent`"link`"\s*:") {
-                $lines[$j] = $lines[$j] -replace '"link"\s*:\s*"[^"]*"', "`"link`": `"$newLink`""
-                $linkUpdated = $true
+        $depthProbe = 1
+        for ($p = $startIdx + 1; $p -lt $lines.Count; $p++) {
+            $probeLine = $lines[$p]
+
+            if ($depthProbe -eq 1 -and $probeLine -match '^(\s*)"[^"]+"\s*:') {
+                $propIndent = $matches[1]
                 break
             }
-            if ($lines[$j] -match '^\s*\}') {
-                $null = $lines[$j] -match '^(\s*)'
-                if ($matches[1].Length -le $propIndentLen) {
-                    $closeBraceIdx = $j
-                    break
+
+            $inStringProbe = $false
+            $probeChars = $probeLine.ToCharArray()
+            for ($q = 0; $q -lt $probeChars.Count; $q++) {
+                if ($probeChars[$q] -eq '"' -and ($q -eq 0 -or $probeChars[$q-1] -ne '\')) {
+                    $inStringProbe = -not $inStringProbe
+                } elseif (-not $inStringProbe) {
+                    if ($probeChars[$q] -eq '{') { $depthProbe++ }
+                    elseif ($probeChars[$q] -eq '}') { $depthProbe-- }
                 }
+            }
+
+            if ($depthProbe -eq 0) { break }
+        }
+
+        # Scan forward: remove any existing "link" property and find the closing brace.
+        # Use brace-depth tracking to properly handle nested structures like arrays.
+        $closeBraceIdx = -1
+        $depth         = 1  # We're starting inside the opening brace of the item
+        $linesToRemove  = @()
+
+        for ($j = $startIdx + 1; $j -lt $lines.Count; $j++) {
+            $line = $lines[$j]
+
+            # Check for existing "link" property at top-level (depth 1 before processing braces on this line)
+            # Match at any indentation level (user may have manually changed indentation)
+            if ($depth -eq 1 -and $line -match '^\s*"link"\s*:') {
+                # Mark this line for removal
+                $linesToRemove += $j
+            }
+
+            # Count braces in this line, ignoring those in strings
+            $inString = $false
+            $chars = $line.ToCharArray()
+            for ($k = 0; $k -lt $chars.Count; $k++) {
+                if ($chars[$k] -eq '"' -and ($k -eq 0 -or $chars[$k-1] -ne '\')) {
+                    $inString = -not $inString
+                } elseif (-not $inString) {
+                    if ($chars[$k] -eq '{') { $depth++ }
+                    elseif ($chars[$k] -eq '}') { $depth-- }
+                }
+            }
+
+            # Found the closing brace of the item
+            if ($depth -eq 0) {
+                $closeBraceIdx = $j
+                break
             }
         }
 
-        if (-not $linkUpdated -and $closeBraceIdx -ne -1) {
-            # Insert "link" before the closing brace
+        # Remove old "link" lines in reverse order to preserve indices
+        foreach ($idx in ($linesToRemove | Sort-Object -Descending)) {
+            # If the line before had a trailing comma (from the link property), remove it
+            if ($idx -gt $startIdx) {
+                $prevLine = $lines[$idx - 1]
+                if ($prevLine -match ',\s*$' -and $lines[$idx].Trim() -match '^}') {
+                    $lines[$idx - 1] = $prevLine -replace ',\s*$', ''
+                }
+            }
+            $lines.RemoveAt($idx)
+            if ($idx -lt $closeBraceIdx) {
+                $closeBraceIdx--
+            }
+        }
+
+        # Now insert "link" before the closing brace (consistent position for all items)
+        if ($closeBraceIdx -ne -1) {
             $prevPropIdx = $closeBraceIdx - 1
             while ($prevPropIdx -gt $startIdx -and $lines[$prevPropIdx].Trim() -eq '') { $prevPropIdx-- }
 
@@ -171,8 +255,8 @@ $repoRoot  = Resolve-Path "$scriptDir/.."
 
 $tweaksJsonPath      = "$repoRoot/config/tweaks.json"
 $featuresJsonPath    = "$repoRoot/config/feature.json"
-$tweaksOutputDir     = "$repoRoot/docs/content/dev/tweaks"
-$featuresOutputDir   = "$repoRoot/docs/content/dev/features"
+$tweaksOutputDir     = "$repoRoot/docs/src/content/docs/code-reference/tweaks"
+$featuresOutputDir   = "$repoRoot/docs/src/content/docs/code-reference/features"
 $publicFunctionsDir  = "$repoRoot/functions/public"
 $privateFunctionsDir = "$repoRoot/functions/private"
 
@@ -216,21 +300,25 @@ Update-Progress "Building button-to-function mapping" 30
 $buttonFunctionMap = Get-ButtonFunctionMapping -ButtonFilePath "$publicFunctionsDir/Invoke-WPFButton.ps1"
 
 Update-Progress "Updating documentation links in JSON" 40
-Add-LinkAttributeToJson -JsonFilePath $tweaksJsonPath   -UrlPrefix "$baseUrl/dev/tweaks"   -ItemNameToCut $itemnametocut
-Add-LinkAttributeToJson -JsonFilePath $featuresJsonPath -UrlPrefix "$baseUrl/dev/features" -ItemNameToCut $itemnametocut
+Add-LinkAttributeToJson -JsonFilePath $tweaksJsonPath   -UrlPrefix "$baseUrl/code-reference/tweaks"   -ItemNameToCut $itemnametocut
+Add-LinkAttributeToJson -JsonFilePath $featuresJsonPath -UrlPrefix "$baseUrl/code-reference/features" -ItemNameToCut $itemnametocut
 
 # Reload lines after link update so line numbers in docs are accurate
 $tweaksLines   = Get-Content -Path $tweaksJsonPath
 $featuresLines = Get-Content -Path $featuresJsonPath
 
 # ==============================================================================
-# Clean up old generated .md files (preserve _index.md)
+# Clean up old generated .mdx files
 # ==============================================================================
 
 Update-Progress "Cleaning up old generated docs" 45
 foreach ($dir in @($tweaksOutputDir, $featuresOutputDir)) {
-    Get-ChildItem -Path $dir -Recurse -Filter *.md | Where-Object {
-        $_.Name -ne "_index.md"
+    if (-Not (Test-Path -Path $dir)) { continue }
+    Get-ChildItem -Path $dir -Recurse -Filter *.mdx | Where-Object {
+        # No category index.mdx pages exist yet. If one is added later as a
+        # category landing page, uncomment this line to keep it from being wiped.
+        # $_.Name -ne "index.mdx"
+        $true
     } | Remove-Item -Force
 }
 
@@ -253,25 +341,28 @@ foreach ($itemName in $tweakNames) {
     $category    = $item.category -replace '[^a-zA-Z0-9]', '-'
     $displayName = $itemName -replace $itemnametocut, ''
     $categoryDir = "$tweaksOutputDir/$category"
-    $filename    = "$categoryDir/$displayName.md"
+    $filename    = "$categoryDir/$displayName.mdx"
 
     if (-Not (Test-Path -Path $categoryDir)) { New-Item -ItemType Directory -Path $categoryDir | Out-Null }
 
-    $title   = $item.Content -replace '"', '\"'
-    $content = "---`r`ntitle: `"$title`"`r`ndescription: `"`"`r`n---`r`n`r`n"
+    $title       = $item.Content -replace '"', '\"'
+    $description = if ($item.Description) { $item.Description -replace '"', '\"' } else { '' }
+    $content     = "---`r`ntitle: `"$title`"`r`ndescription: `"$description`"`r`neditUrl: false`r`n---`r`n`r`n"
 
     if ($item.Type -eq "Button") {
         $funcName = $buttonFunctionMap[$itemName]
         if ($funcName -and $functionFiles.ContainsKey($funcName)) {
             $func     = $functionFiles[$funcName]
-            $content += "``````powershell {filename=`"$($func.RelativePath)`",linenos=inline,linenostart=1}`r`n"
+            $content += Get-GeneratedFromNote -SourceRelativePath $func.RelativePath
+            $content += "``````powershell title=`"$($func.RelativePath)`"`r`n"
             $content += $func.Content + "`r`n"
             $content += "```````r`n"
         }
     } else {
         $jsonBlock = Get-RawJsonBlock -ItemName $itemName -JsonLines $tweaksLines
         if ($jsonBlock) {
-            $content += "``````json {filename=`"config/tweaks.json`",linenos=inline,linenostart=$($jsonBlock.LineNumber)}`r`n"
+            $content += Get-GeneratedFromNote -SourceRelativePath "config/tweaks.json"
+            $content += "``````json title=`"config/tweaks.json`"`r`n"
             $content += $jsonBlock.RawText + "`r`n"
             $content += "```````r`n"
         }
@@ -309,25 +400,28 @@ foreach ($itemName in $featureNames) {
     $category    = $item.category -replace '[^a-zA-Z0-9]', '-'
     $displayName = $itemName -replace $itemnametocut, ''
     $categoryDir = "$featuresOutputDir/$category"
-    $filename    = "$categoryDir/$displayName.md"
+    $filename    = "$categoryDir/$displayName.mdx"
 
     if (-Not (Test-Path -Path $categoryDir)) { New-Item -ItemType Directory -Path $categoryDir | Out-Null }
 
-    $title   = $item.Content -replace '"', '\"'
-    $content = "---`r`ntitle: `"$title`"`r`ndescription: `"`"`r`n---`r`n`r`n"
+    $title       = $item.Content -replace '"', '\"'
+    $description = if ($item.Description) { $item.Description -replace '"', '\"' } else { '' }
+    $content     = "---`r`ntitle: `"$title`"`r`ndescription: `"$description`"`r`neditUrl: false`r`n---`r`n`r`n"
 
     if ($item.category -in $functionEmbedCategories) {
         $funcName = if ($item.function) { $item.function } else { $buttonFunctionMap[$itemName] }
         if ($funcName -and $functionFiles.ContainsKey($funcName)) {
             $func     = $functionFiles[$funcName]
-            $content += "``````powershell {filename=`"$($func.RelativePath)`",linenos=inline,linenostart=1}`r`n"
+            $content += Get-GeneratedFromNote -SourceRelativePath $func.RelativePath
+            $content += "``````powershell title=`"$($func.RelativePath)`"`r`n"
             $content += $func.Content + "`r`n"
             $content += "```````r`n"
         }
     } else {
         $jsonBlock = Get-RawJsonBlock -ItemName $itemName -JsonLines $featuresLines
         if ($jsonBlock) {
-            $content += "``````json {filename=`"config/feature.json`",linenos=inline,linenostart=$($jsonBlock.LineNumber)}`r`n"
+            $content += Get-GeneratedFromNote -SourceRelativePath "config/feature.json"
+            $content += "``````json title=`"config/feature.json`"`r`n"
             $content += $jsonBlock.RawText + "`r`n"
             $content += "```````r`n"
         }

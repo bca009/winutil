@@ -23,9 +23,9 @@ function Find-TweaksByNameOrDescription {
         [string]$SearchString = ""
     )
 
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
     # 1. RESOLVE $SYNC WITH MULTI-LEVEL FALLBACK
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
 
     if ($null -eq $Sync) {
         $Sync = $global:sync
@@ -45,13 +45,18 @@ function Find-TweaksByNameOrDescription {
         return
     }
 
-    # ──────────────────────────────────────────────────────────────────────────────
-    # 2. GET REFERENCE TO TWEAKS PANEL
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
+    # 2. GET REFERENCE TO TWEAKS OR APPX PANEL
+    # ------------------------------------------------------------------------------
+
+    $panelName = "tweakspanel"
+    if ($null -ne $Sync.currentTab -and $Sync.currentTab -eq "AppX") {
+        $panelName = "appxpanel"
+    }
 
     $tweaksPanel = $null
     try {
-        $tweaksPanel = $Sync.Form.FindName("tweakspanel")
+        $tweaksPanel = $Sync.Form.FindName($panelName)
     }
     catch {
         # Silent return - panel not found or disposed
@@ -63,9 +68,9 @@ function Find-TweaksByNameOrDescription {
         return
     }
 
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
     # 3. HANDLE EMPTY/WHITESPACE SEARCH STRING - RESET TO DEFAULT STATE
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
 
     if ([string]::IsNullOrWhiteSpace($SearchString)) {
         try {
@@ -85,18 +90,25 @@ function Find-TweaksByNameOrDescription {
                     }
 
                     if ($dockPanel -is [Windows.Controls.DockPanel]) {
-                        $itemsControl = $null
-                        $itemsControl = $dockPanel.Children | Where-Object { $_ -is [Windows.Controls.ItemsControl] } | Select-Object -First 1
+                        $container = $dockPanel.Children | Where-Object { $_ -is [Windows.Controls.ItemsControl] -or $_ -is [Windows.Controls.StackPanel] -or $_ -is [Windows.Controls.ScrollViewer] -or $_.GetType().Name -eq "ItemsControl" } | Select-Object -First 1
 
-                        if ($null -ne $itemsControl) {
+                        if ($null -ne $container) {
+                            $targetPanel = if ($container.PSObject.Properties['Content'] -and $null -ne $container.Content) { $container.Content } else { $container }
+                            $items = $null
+                            if ($targetPanel -is [Windows.Controls.ItemsControl] -or $targetPanel.GetType().Name -eq "ItemsControl") {
+                                $items = $targetPanel.Items
+                            }
+                            else {
+                                $items = $targetPanel.Children
+                            }
                             # Show all items in the category
-                            foreach ($item in $itemsControl.Items) {
+                            foreach ($item in $items) {
                                 if ($null -ne $item) {
-                                    # Check if it's a category label (first Label in the ItemsControl)
-                                    if ($item -is [Windows.Controls.Label]) {
+                                    # Check if it's a category label (first Label in the container)
+                                    if ($item -is [Windows.Controls.Label] -or $item.GetType().Name -eq "Label") {
                                         $item.Visibility = [Windows.Visibility]::Visible
                                     }
-                                    elseif ($item -is [Windows.Controls.DockPanel] -or $item -is [Windows.Controls.StackPanel]) {
+                                    elseif ($item -is [Windows.Controls.DockPanel] -or $item -is [Windows.Controls.StackPanel] -or $item.GetType().Name -eq "DockPanel" -or $item.GetType().Name -eq "StackPanel") {
                                         # Show all checkbox containers
                                         $item.Visibility = [Windows.Visibility]::Visible
                                     }
@@ -109,14 +121,15 @@ function Find-TweaksByNameOrDescription {
         }
         catch {
             # Silent catch - UI element may be disposed
+            $null = $_
         }
 
         return
     }
 
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
     # 4. PERFORM LITERAL SEARCH (NO WILDCARD EXPANSION)
-    # ──────────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------------------
 
     try {
         # Normalize search term once for the entire operation
@@ -137,41 +150,46 @@ function Find-TweaksByNameOrDescription {
                 }
 
                 if ($dockPanel -is [Windows.Controls.DockPanel]) {
-                    $itemsControl = $null
-                    $itemsControl = $dockPanel.Children | Where-Object { $_ -is [Windows.Controls.ItemsControl] } | Select-Object -First 1
+                    $container = $dockPanel.Children | Where-Object { $_ -is [Windows.Controls.ItemsControl] -or $_ -is [Windows.Controls.StackPanel] -or $_ -is [Windows.Controls.ScrollViewer] -or $_.GetType().Name -eq "ItemsControl" } | Select-Object -First 1
 
-                    if ($null -ne $itemsControl) {
+                    if ($null -ne $container) {
                         $categoryLabel = $null
 
-                        # Process all items (checkboxes, labels, panels) in the ItemsControl
-                        for ($i = 0; $i -lt $itemsControl.Items.Count; $i++) {
-                            $item = $itemsControl.Items[$i]
-
+                        $targetPanel = if ($container.PSObject.Properties['Content'] -and $null -ne $container.Content) { $container.Content } else { $container }
+                        $items = $null
+                        if ($targetPanel -is [Windows.Controls.ItemsControl] -or $targetPanel.GetType().Name -eq "ItemsControl") {
+                            $items = $targetPanel.Items
+                        }
+                        else {
+                            $items = $targetPanel.Children
+                        }
+                        # Process all items (checkboxes, labels, panels) in the container
+                        foreach ($item in $items) {
                             if ($null -eq $item) {
                                 continue
                             }
 
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
                             # Check if this is a category label (usually first Label)
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
 
-                            if ($item -is [Windows.Controls.Label]) {
+                            if ($item -is [Windows.Controls.Label] -or $item.GetType().Name -eq "Label") {
                                 $categoryLabel = $item
                                 # Initially hide category label; show it only if matches found
                                 $item.Visibility = [Windows.Visibility]::Collapsed
                             }
 
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
                             # Check if this is a DockPanel containing a tweak checkbox
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
 
-                            elseif ($item -is [Windows.Controls.DockPanel]) {
+                            elseif ($item -is [Windows.Controls.DockPanel] -or $item.GetType().Name -eq "DockPanel") {
                                 $checkbox = $null
                                 $label = $null
 
                                 # Safely extract checkbox and label
-                                $checkbox = $item.Children | Where-Object { $_ -is [Windows.Controls.CheckBox] } | Select-Object -First 1
-                                $label = $item.Children | Where-Object { $_ -is [Windows.Controls.Label] } | Select-Object -First 1
+                                $checkbox = $item.Children | Where-Object { $_ -is [Windows.Controls.CheckBox] -or $_.GetType().Name -eq "CheckBox" } | Select-Object -First 1
+                                $label = $item.Children | Where-Object { $_ -is [Windows.Controls.Label] -or $_.GetType().Name -eq "Label" } | Select-Object -First 1
 
                                 # Check if tweak matches search criteria
                                 $itemMatches = $false
@@ -211,13 +229,13 @@ function Find-TweaksByNameOrDescription {
                                 }
                             }
 
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
                             # Check if this is a StackPanel containing a tweak checkbox
-                            # ────────────────────────────────────────────────────────────
+                            # ------------------------------------------------------------
 
-                            elseif ($item -is [Windows.Controls.StackPanel]) {
+                            elseif ($item -is [Windows.Controls.StackPanel] -or $item.GetType().Name -eq "StackPanel") {
                                 $checkbox = $null
-                                $checkbox = $item.Children | Where-Object { $_ -is [Windows.Controls.CheckBox] } | Select-Object -First 1
+                                $checkbox = $item.Children | Where-Object { $_ -is [Windows.Controls.CheckBox] -or $_.GetType().Name -eq "CheckBox" } | Select-Object -First 1
 
                                 $itemMatches = $false
 
@@ -257,9 +275,9 @@ function Find-TweaksByNameOrDescription {
                             }
                         }
 
-                        # ────────────────────────────────────────────────────────────
+                        # ------------------------------------------------------------
                         # Update category label visibility and expanded/collapsed state
-                        # ────────────────────────────────────────────────────────────
+                        # ------------------------------------------------------------
 
                         if ($categoryHasMatch) {
                             # Show category label
@@ -282,9 +300,9 @@ function Find-TweaksByNameOrDescription {
                     }
                 }
 
-                # ────────────────────────────────────────────────────────────────
+                # ----------------------------------------------------------------
                 # Set category border visibility based on whether it has matches
-                # ────────────────────────────────────────────────────────────────
+                # ----------------------------------------------------------------
 
                 if ($categoryHasMatch) {
                     $categoryBorder.Visibility = [Windows.Visibility]::Visible
@@ -298,5 +316,6 @@ function Find-TweaksByNameOrDescription {
     catch {
         # Silent catch - UI elements may be disposed or in unexpected state
         # Do not log to terminal as this function is called on every keystroke
+        $null = $_
     }
 }

@@ -1,51 +1,86 @@
 function Update-WinUtilSelections {
-    <#
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$flatJson,
 
-    .SYNOPSIS
-        Updates the $sync.selected variables with a given preset.
+        [switch]$Replace,
 
-    .PARAMETER flatJson
-        The flattened json list of $sync values to select.
-    #>
-
-    param (
-        $flatJson
+        [switch]$SkipUnknown
     )
 
-    foreach ($item in $flatJson) {
-        # Ensure each item is treated as a string to handle PSCustomObject from JSON deserialization
-        $cbkey = [string]$item
-        $group = if ($cbkey.StartsWith("WPFInstall")) { "Install" }
-                    elseif ($cbkey.StartsWith("WPFTweaks")) { "Tweaks" }
-                    elseif ($cbkey.StartsWith("WPFToggle")) { "Toggle" }
-                    elseif ($cbkey.StartsWith("WPFFeature")) { "Feature" }
-                    else { "na" }
+    $nextSelections = @{
+        selectedApps     = [System.Collections.Generic.List[string]]::new()
+        selectedTweaks   = [System.Collections.Generic.List[string]]::new()
+        selectedToggles  = [System.Collections.Generic.List[string]]::new()
+        selectedFeatures = [System.Collections.Generic.List[string]]::new()
+        selectedAppx     = [System.Collections.Generic.List[string]]::new()
+    }
 
-        switch ($group) {
-            "Install" {
-                if (!$sync.selectedApps.Contains($cbkey)) {
-                    $sync.selectedApps.Add($cbkey)
-                    # The List type needs to be specified again, because otherwise Sort-Object will convert the list to a string if there is only a single entry
-                    [System.Collections.Generic.List[string]]$sync.selectedApps = $sync.SelectedApps | Sort-Object
-                }
+    foreach ($cbkey in $flatJson) {
+
+        $listName = switch -Regex ($cbkey) {
+            '^WPFInstall' { 'selectedApps' }
+            '^WPFTweaks'  { 'selectedTweaks' }
+            '^WPFToggle'  { 'selectedToggles' }
+            '^WPFFeature' { 'selectedFeatures' }
+            '^WPFAppx'    { 'selectedAppx' }
+        }
+
+        if (-not $listName) {
+            if ($SkipUnknown) {
+                $cbkey
+                continue
             }
-            "Tweaks" {
-                if (!$sync.selectedTweaks.Contains($cbkey)) {
-                    $sync.selectedTweaks.Add($cbkey)
-                }
+            throw "Unsupported selection key '$cbkey'."
+        }
+
+        $isKnownSelection = switch ($listName) {
+            'selectedApps' {
+                $sync.configs.applicationsHashtable.ContainsKey($cbkey)
             }
-            "Toggle" {
-                if (!$sync.selectedToggles.Contains($cbkey)) {
-                    $sync.selectedToggles.Add($cbkey)
-                }
+            'selectedTweaks' {
+                $null -ne $sync.configs.tweaks.PSObject.Properties[$cbkey]
             }
-            "Feature" {
-                if (!$sync.selectedFeatures.Contains($cbkey)) {
-                    $sync.selectedFeatures.Add($cbkey)
-                }
+            'selectedToggles' {
+                $null -ne $sync.configs.tweaks.PSObject.Properties[$cbkey]
             }
-            default {
-                Write-Host "Unknown group for checkbox: $($cbkey)"
+            'selectedFeatures' {
+                $null -ne $sync.configs.feature.PSObject.Properties[$cbkey]
+            }
+            'selectedAppx' {
+                $sync.configs.appxHashtable.ContainsKey($cbkey)
+            }
+        }
+
+        if (-not $isKnownSelection) {
+            if ($SkipUnknown) {
+                $cbkey
+                continue
+            }
+            throw "Unknown selection key '$cbkey'."
+        }
+
+        $nextSelections[$listName].Add($cbkey)
+    }
+
+    $validSelectionCount = ($nextSelections.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+    if ($SkipUnknown -and $validSelectionCount -eq 0) {
+        return
+    }
+
+    if ($Replace) {
+        foreach ($listName in $nextSelections.Keys) {
+            $sync[$listName] = $nextSelections[$listName]
+        }
+        return
+    }
+
+    foreach ($listName in $nextSelections.Keys) {
+        foreach ($cbkey in $nextSelections[$listName]) {
+            # Appending, so the same entry can already be there: a preset and a config that both
+            # name it would otherwise select it twice
+            if ($sync.$listName -notcontains $cbkey) {
+                $sync.$listName.Add($cbkey)
             }
         }
     }

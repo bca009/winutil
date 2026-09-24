@@ -8,9 +8,16 @@ function Invoke-WPFUpdatesdisable {
         Disabling Windows Update is not recommended. This is only for advanced users who know what they are doing.
 
     #>
-    $ErrorActionPreference = 'SilentlyContinue'
+    param([switch]$Confirmed)
+
+    if (-not $Confirmed -and -not (Confirm-WPFUpdatesdisable)) {
+        return
+    }
+
+    Write-WinUtilLog -Component "Updates" -Message "Disabling Windows Update settings."
 
     Write-Host "Configuring registry settings..." -ForegroundColor Yellow
+    Write-WinUtilLog -Component "Updates" -Message "Configuring Windows Update registry policy values for disable mode."
     New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Force
 
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Type DWord -Value 1
@@ -19,23 +26,19 @@ function Invoke-WPFUpdatesdisable {
     New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config" -Force
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config" -Name "DODownloadMode" -Type DWord -Value 0
 
-    Write-Host "Hiding Windows Updates from settings"
-    Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer -Name SettingsPageVisibility -Value hide:windowsupdate
+    foreach ($serviceName in @("BITS", "wuauserv", "UsoSvc")) {
+        Write-Host "Stopping and disabling $serviceName service."
+        Write-WinUtilLog -Component "Updates" -Message "Stopping and disabling $serviceName service."
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        Set-Service -Name $serviceName -StartupType Disabled
+    }
 
-    Write-Host "Disabled BITS Service"
-    Set-Service -Name BITS -StartupType Disabled
-
-    Write-Host "Disabled wuauserv Service"
-    Set-Service -Name wuauserv -StartupType Disabled
-
-    Write-Host "Disabled UsoSvc Service"
-    Stop-Service -Name UsoSvc -Force
-    Set-Service -Name UsoSvc -StartupType Disabled
-
-    Remove-Item "C:\Windows\SoftwareDistribution\*" -Recurse -Force
-    Write-Host "Cleared SoftwareDistribution folder"
+    Remove-Item -Path "C:\Windows\SoftwareDistribution\*" -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Cleared SoftwareDistribution folder."
+    Write-WinUtilLog -Component "Updates" -Message "Cleared SoftwareDistribution folder."
 
     Write-Host "Disabling update related scheduled tasks..." -ForegroundColor Yellow
+    Write-WinUtilLog -Component "Updates" -Message "Disabling update related scheduled tasks."
 
     $Tasks =
         '\Microsoft\Windows\InstallService\*',
@@ -46,12 +49,24 @@ function Invoke-WPFUpdatesdisable {
         '\Microsoft\WindowsUpdate\*'
 
     foreach ($Task in $Tasks) {
-        Get-ScheduledTask -TaskPath $Task | Disable-ScheduledTask -ErrorAction SilentlyContinue
+        Get-ScheduledTask -TaskPath $Task -ErrorAction SilentlyContinue | Disable-ScheduledTask -ErrorAction SilentlyContinue
     }
 
-    Write-Host "=================================" -ForegroundColor Green
-    Write-Host "---   Updates Are Disabled    ---" -ForegroundColor Green
-    Write-Host "=================================" -ForegroundColor Green
 
     Write-Host "Note: You must restart your system in order for all changes to take effect." -ForegroundColor Yellow
+    Write-WinUtilLog -Component "Updates" -Message "Windows Update disable workflow completed. Restart required."
+}
+
+function Confirm-WPFUpdatesdisable {
+    $confirmation = Show-WinUtilMessage `
+        -Message "Disabling Windows Update stops update services, disables scheduled tasks, and clears downloaded update files. Security updates will not be installed until defaults are restored. Continue?" `
+        -Title "Disable Windows Update?" `
+        -Button "YesNo" `
+        -Icon "Warning"
+
+    if ($confirmation -ne "Yes") {
+        Write-WinUtilLog -Component "Updates" -Message "Windows Update disable workflow cancelled."
+        return $false
+    }
+    return $true
 }
