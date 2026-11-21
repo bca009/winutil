@@ -1,7 +1,5 @@
-#===========================================================================
-# Tests - Config Files
-#===========================================================================
-
+#====================================================================# Tests - Config Files
+#====================================================================
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $configRoot = Join-Path $PSScriptRoot "..\config"
 $functionRoot = Join-Path $repoRoot "functions"
@@ -112,6 +110,19 @@ function script:Get-WinUtilButtonSwitchNames {
         ForEach-Object { $_.Groups[1].Value } |
         Sort-Object -Unique
 }
+
+# Stand-ins so the Telemetry tweak's extracted Defender handler can run in a test without
+# touching Defender or the real log file.
+function script:Set-MpPreference {
+    [CmdletBinding()]
+    param([int]$SubmitSamplesConsent)
+
+    throw "Set-MpPreference must be mocked: $SubmitSamplesConsent"
+}
+
+function script:Write-WinUtilLog {
+    param($Level, $Component, $Message)
+}
 }
 
 Describe "Config files" {
@@ -218,6 +229,86 @@ Describe "Tweaks config" {
         }
     }
 
+    It "keeps the svchost split threshold out of the services tweak" -TestCases $testCase {
+        param([string]$Path)
+
+        $tweaks = Get-Content -Path $Path -Raw | ConvertFrom-Json
+
+        $tweaks.WPFTweaksServices.InvokeScript | Should -BeNullOrEmpty
+
+        $invokeScript = @($tweaks.WPFTweaksSvcHostSplitting.InvokeScript) -join "`n"
+        $undoScript = @($tweaks.WPFTweaksSvcHostSplitting.UndoScript) -join "`n"
+        $invokeScript | Should -Match 'SvcHostSplitThresholdInKB'
+        $undoScript | Should -Match 'SvcHostSplitThresholdInKB'
+        $undoScript | Should -Match '3670016'
+    }
+
+    It "does not claim the same registry value with conflicting originals or types" -TestCases $testCase {
+        param([string]$Path)
+
+        $tweaks = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $claims = @{}
+
+        foreach ($tweak in $tweaks.PSObject.Properties) {
+            foreach ($registryEntry in @($tweak.Value.registry)) {
+                if ($null -eq $registryEntry -or $registryEntry.Values) { continue }
+
+                $key = "$($registryEntry.Path)|$($registryEntry.Name)"
+                if (-not $claims.ContainsKey($key)) {
+                    $claims[$key] = @{}
+                }
+                $claims[$key][$tweak.Name] = [pscustomobject]@{
+                    OriginalValue = [string]$registryEntry.OriginalValue
+                    Type          = [string]$registryEntry.Type
+                }
+            }
+        }
+
+        $conflicts = New-Object System.Collections.Generic.List[string]
+        foreach ($key in $claims.Keys) {
+            $variants = @($claims[$key].Values | Select-Object -Unique -Property OriginalValue, Type)
+            if ($variants.Count -gt 1) {
+                $owners = ($claims[$key].Keys | Sort-Object) -join ", "
+                $conflicts.Add("$key claimed with conflicting originals/types by: $owners")
+            }
+        }
+
+        if ($conflicts.Count -gt 0) {
+            throw ($conflicts -join "`n")
+        }
+    }
+
+    It "disables Windows Search indexing through the service schema with a reversible stop and start" -TestCases $testCase {
+        param([string]$Path)
+
+        $tweaks = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $tweak = $tweaks.WPFTweaksDisableSearchIndexing
+
+        $tweak | Should -Not -BeNullOrEmpty
+        $tweak.category | Should -Be "z__Advanced Tweaks - CAUTION"
+        $tweak.Description | Should -Match "slower"
+
+        $search = @($tweak.service | Where-Object Name -eq "WSearch")
+        $search | Should -HaveCount 1
+        $search[0].StartupType | Should -Be "Disabled"
+        $search[0].OriginalType | Should -Be "Automatic"
+
+        # Set-WinUtilService only changes the startup type. The running indexer is stopped in
+        # InvokeScript and started again in UndoScript, both guarded by Get-Service so a missing
+        # service does not log an error (#5123).
+        $invoke = @($tweak.InvokeScript) -join "`n"
+        $undo = @($tweak.UndoScript) -join "`n"
+        $invoke | Should -Match 'Get-Service.*WSearch'
+        $invoke | Should -Match 'Stop-Service.*WSearch'
+        $undo | Should -Match 'Get-Service.*WSearch'
+        $undo | Should -Match 'Start-Service.*WSearch'
+
+        # The scripts only act once the service entry has actually changed the startup type, so a
+        # service the user moved to Manual (kept by KeepServiceStartup) is neither stopped nor started.
+        $invoke | Should -Match "StartType -eq 'Disabled'"
+        $undo | Should -Match "StartType -eq 'Automatic'"
+    }
+
     It "keeps the location service disabled" -TestCases $testCase {
         param([string]$Path)
 
@@ -226,6 +317,46 @@ Describe "Tweaks config" {
 
         $locationServices | Should -HaveCount 1
         $locationServices[0].StartupType | Should -Be "Disabled"
+    }
+
+    It "disables Windows Error Reporting through the service schema" -TestCases $testCase {
+        param([string]$Path)
+
+        $tweaks = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $telemetry = $tweaks.WPFTweaksTelemetry
+        $errorReporting = @($telemetry.service | Where-Object Name -eq "WerSvc")
+
+        $errorReporting | Should -HaveCount 1
+        $errorReporting[0].StartupType | Should -Be "Disabled"
+        $errorReporting[0].OriginalType | Should -Be "Manual"
+
+        # Telemetry and error reporting must coexist after merging their independent fixes.
+        $diagnostics = @($telemetry.service | Where-Object Name -eq "diagtrack")
+        $diagnostics | Should -HaveCount 1
+        $diagnostics[0].StartupType | Should -Be "Disabled"
+        $diagnostics[0].OriginalType | Should -Be "Automatic"
+        ((@($telemetry.InvokeScript) + @($telemetry.UndoScript)) -join "`n") |
+            Should -Not -Match 'Set-Service\s+-Name\s+diagtrack'
+
+        # wermgr is an executable, not a service, so Set-Service on it failed on every run (#5145)
+        $scripts = (@($telemetry.InvokeScript) + @($telemetry.UndoScript)) -join "`n"
+        $scripts | Should -Not -Match "wermgr"
+    }
+
+    It "removes the feedback period value through the registry schema" -TestCases $testCase {
+        param([string]$Path)
+
+        $tweaks = Get-Content -Path $Path -Raw | ConvertFrom-Json
+        $telemetry = $tweaks.WPFTweaksTelemetry
+        $period = @($telemetry.registry | Where-Object Name -eq "PeriodInNanoSeconds")
+
+        $period | Should -HaveCount 1
+        $period[0].Path | Should -Be "HKCU:\Software\Microsoft\Siuf\Rules"
+        $period[0].Value | Should -Be "<RemoveEntry>"
+
+        # A bare Remove-ItemProperty in the script errored on a fresh install, where the value
+        # does not exist yet (#5145); Set-WinUtilRegistry treats an absent value as removed.
+        (@($telemetry.InvokeScript) -join "`n") | Should -Not -Match "Remove-ItemProperty"
     }
 
     $icaclsPrincipalCases = @(
@@ -245,7 +376,7 @@ Describe "Tweaks config" {
             Path          = (Join-Path $configRoot "tweaks.json")
             Tweak         = "WPFTweaksRemoveOneDrive"
             Sid           = '*S-1-5-32-544'
-            ExpectedCount = 2
+            ExpectedCount = 1
         }
     )
 
@@ -257,6 +388,204 @@ Describe "Tweaks config" {
         $sidCount = ([regex]::Matches($scripts, [regex]::Escape($Sid))).Count
 
         $sidCount | Should -Be $ExpectedCount -Because "$Tweak must pass $Sid to icacls at every call site instead of a localized account name"
+    }
+}
+
+Describe "Config scripts changing services" {
+    It "guards every Set-Service call in a config script with a service or template existence check" {
+        $unguarded = New-Object System.Collections.Generic.List[string]
+
+        foreach ($configFile in (Get-ChildItem -Path $script:configRoot -Filter *.json)) {
+            $config = Get-Content -Path $configFile.FullName -Raw | ConvertFrom-Json
+            foreach ($entry in $config.PSObject.Properties) {
+                foreach ($field in @("InvokeScript", "UndoScript")) {
+                    if (-not (Test-WinUtilHasProperty -Object $entry.Value -Name $field)) { continue }
+
+                    foreach ($scriptText in @($entry.Value.$field)) {
+                        if ([string]$scriptText -notmatch 'Set-Service') { continue }
+                        if ([string]$scriptText -notmatch 'Get-Service|Test-Path -LiteralPath.*CurrentControlSet') {
+                            $unguarded.Add("$($configFile.Name):$($entry.Name).$field")
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($unguarded.Count -gt 0) {
+            throw ("Unguarded Set-Service calls abort the rest of their script block when the service is missing:`n" + ($unguarded -join "`n"))
+        }
+    }
+}
+
+Describe "Config scripts changing Defender preferences" {
+    It "guards every Set-MpPreference call with a try block and -ErrorAction Stop" {
+        $unguarded = New-Object System.Collections.Generic.List[string]
+
+        foreach ($configFile in (Get-ChildItem -Path $script:configRoot -Filter *.json)) {
+            $config = Get-Content -Path $configFile.FullName -Raw | ConvertFrom-Json
+            foreach ($entry in $config.PSObject.Properties) {
+                foreach ($field in @("InvokeScript", "UndoScript")) {
+                    if (-not (Test-WinUtilHasProperty -Object $entry.Value -Name $field)) { continue }
+
+                    foreach ($scriptText in @($entry.Value.$field)) {
+                        if ([string]$scriptText -notmatch 'Set-MpPreference') { continue }
+
+                        $source = [scriptblock]::Create([string]$scriptText)
+                        $calls = @($source.Ast.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.CommandAst] -and
+                                $node.GetCommandName() -eq 'Set-MpPreference'
+                        }, $true))
+
+                        foreach ($call in $calls) {
+                            $hasStop = $call.Extent.Text -match '-ErrorAction\s*:?\s*Stop'
+
+                            $insideTryBody = $false
+                            $child = $call
+                            $parent = $call.Parent
+                            while ($null -ne $parent) {
+                                if ($parent -is [System.Management.Automation.Language.TryStatementAst] -and
+                                    [object]::ReferenceEquals($parent.Body, $child)) {
+                                    $insideTryBody = $true
+                                    break
+                                }
+                                $child = $parent
+                                $parent = $parent.Parent
+                            }
+
+                            if (-not $hasStop -or -not $insideTryBody) {
+                                $unguarded.Add("$($configFile.Name):$($entry.Name).$field line $($call.Extent.StartLineNumber)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($unguarded.Count -gt 0) {
+            throw ("Set-MpPreference calls must be inside a try block and pass -ErrorAction Stop, so unavailable Defender can be handled without hiding other failures:`n" + ($unguarded -join "`n"))
+        }
+    }
+}
+
+Describe "Telemetry tweak Defender failures" {
+    BeforeAll {
+        function Get-DefenderGuardBlock {
+            param([string]$Action)
+
+            $source = [scriptblock]::Create((Get-WinUtilConfigObject -Name "tweaks").WPFTweaksTelemetry.$Action -join "`n")
+            $blocks = @($source.Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.TryStatementAst] -and
+                    $node.Extent.Text -match 'Set-MpPreference'
+            }, $true))
+            $blocks.Count | Should -Be 1
+            [scriptblock]::Create($blocks[0].Extent.Text)
+        }
+    }
+
+    It "warns and continues when Defender is unavailable (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        Mock Write-WinUtilLog {}
+        # The message omits the code on purpose, so only the HResult check can match this failure.
+        Mock Set-MpPreference {
+            throw [System.Management.Automation.ErrorRecord]::new(
+                [System.Runtime.InteropServices.COMException]::new("Defender provider unavailable.", [int]0x800106ba),
+                "DefenderUnavailable",
+                [System.Management.Automation.ErrorCategory]::ResourceUnavailable,
+                $null
+            )
+        }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Not -Throw
+
+        Should -Invoke Write-WinUtilLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' }
+    }
+
+    It "warns for a message-only provider error and continues under caller Continue (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        $ErrorActionPreference = 'Continue'
+        Mock Write-WinUtilLog {}
+        Mock Write-Warning {}
+        Mock Set-MpPreference { Write-Error "Operation failed with the following error: 0x800106BA." }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Not -Throw
+
+        Should -Invoke Write-Warning -Times 1 -Exactly
+        Should -Invoke Write-WinUtilLog -Times 1 -Exactly -ParameterFilter {
+            $Level -eq 'WARN' -and $Component -eq 'Script' -and $Message -like '*Defender*'
+        }
+    }
+
+    It "sets the requested consent when Defender is available (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript"; Consent = 2 }
+        @{ Action = "UndoScript"; Consent = 1 }
+    ) {
+        param($Action, $Consent)
+        Mock Write-WinUtilLog {}
+        Mock Write-Warning {}
+        Mock Set-MpPreference {}
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Not -Throw
+
+        Should -Invoke Set-MpPreference -Times 1 -Exactly -ParameterFilter {
+            $SubmitSamplesConsent -eq $Consent -and $ErrorAction -eq 'Stop'
+        }
+        Should -Invoke Write-Warning -Times 0 -Exactly
+        Should -Invoke Write-WinUtilLog -Times 0 -Exactly
+    }
+
+    It "rethrows access denied with a structured unrelated HResult (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        Mock Set-MpPreference {
+            throw [System.Management.Automation.ErrorRecord]::new(
+                [System.UnauthorizedAccessException]::new("Access denied."),
+                "DefenderAccessDenied",
+                [System.Management.Automation.ErrorCategory]::PermissionDenied,
+                $null
+            )
+        }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Throw -ExpectedMessage "*Access denied*"
+    }
+
+    It "rethrows a missing Defender command (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        Mock Set-MpPreference { throw [System.Management.Automation.CommandNotFoundException]::new("Set-MpPreference is unavailable.") }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Throw -ExpectedMessage "*Set-MpPreference is unavailable*"
+    }
+
+    It "does not confuse a longer hexadecimal value with the unavailable code (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        Mock Set-MpPreference { throw "Unrelated error value: 0x800106bad." }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Throw -ExpectedMessage "*0x800106bad*"
+    }
+
+    It "rethrows Set-MpPreference failures that are not Defender being unavailable (<Action>)" -TestCases @(
+        @{ Action = "InvokeScript" }
+        @{ Action = "UndoScript" }
+    ) {
+        param($Action)
+        Mock Set-MpPreference { throw "Operation failed with the following error: 0x80041001." }
+
+        { & (Get-DefenderGuardBlock -Action $Action) } | Should -Throw -ExpectedMessage "*0x80041001*"
     }
 }
 
@@ -601,6 +930,11 @@ Describe "UI-rendered config entries" {
             $themes.Dark.PSObject.Properties.Name
             "CBorderColor"
             "CButtonBackgroundMouseoverColor"
+            "CAppIconShadowColor"
+            # Set from the width of the app list (Update-WinUtilAppEntryWidth), not by a theme
+            "AppEntryCardWidth"
+            "CMainGradientTopColor"
+            "CMainGradientBottomColor"
         ) | Sort-Object -Unique
 
         foreach ($resourceName in $dynamicResourceNames) {
